@@ -101,7 +101,7 @@ public final class ReaderImpl implements StoreReader {
 
   @Override
   public <K> K get(Object key) {
-    return (K) get(key, null);
+    return get(key, null);
   }
 
   @Override
@@ -110,25 +110,8 @@ public final class ReaderImpl implements StoreReader {
     if (key == null) {
       throw new NullPointerException("The key can't be null");
     }
-    K value = cache.get(key);
-    if (value == null) {
-      try {
-        byte[] valueBytes = storage.get(serialization.serializeKey(key));
-        if (valueBytes != null) {
-
-          Object v = serialization.deserialize(dataInputOutput.reset(valueBytes));
-          cache.put(key, v);
-          return (K) v;
-        } else {
-          return defaultValue;
-        }
-      } catch (Exception ex) {
-        throw new RuntimeException(ex);
-      }
-    } else if (value == StorageCache.NULL_VALUE) {
-      return null;
-    }
-    return value;
+    K cachedValue = optimisticGet(key);
+    return cachedValue != null ? cachedValue : getFromStorage(key, defaultValue);
   }
 
   @Override
@@ -421,6 +404,44 @@ public final class ReaderImpl implements StoreReader {
   private void checkOpen() {
     if (!opened) {
       throw new IllegalStateException("The store is closed");
+    }
+  }
+
+  /**
+   * Gets value from cache
+   */
+  private <K> K  optimisticGet(Object key) {
+    checkOpen();
+    if (key == null) {
+      throw new NullPointerException("The key can't be null");
+    }
+    K value = cache.get(key);
+    if (value == StorageCache.NULL_VALUE) {
+      return null;
+    }
+    return value;
+  }
+
+  /**
+   * gets value from file system and add it to the cache
+   * @param key key to fetch
+   * @param defaultValue default value
+   * @param <K> return type
+   * @return value of <code>defaultValue</code> if not found
+   */
+  private synchronized  <K> K getFromStorage (Object key, K defaultValue)
+  {
+    try {
+      byte[] valueBytes = storage.get(serialization.serializeKey(key));
+      if (valueBytes != null) {
+        Object v = serialization.deserialize(dataInputOutput.reset(valueBytes));
+        cache.put(key, v);
+        return (K) v;
+      } else {
+        return defaultValue;
+      }
+    } catch (Exception ex) {
+      throw new RuntimeException(ex);
     }
   }
 }
