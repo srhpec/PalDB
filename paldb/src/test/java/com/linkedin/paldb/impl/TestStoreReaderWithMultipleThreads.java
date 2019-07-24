@@ -9,6 +9,7 @@ import com.linkedin.paldb.utils.LongPacker;
 import org.testng.Assert;
 import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
+import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
 
 import java.io.DataInput;
@@ -32,22 +33,22 @@ public class TestStoreReaderWithMultipleThreads
     private final File STORE_FILE = new File(STORE_FOLDER, "paldb.dat");
 
     // stores the generated test values to verify them after concurrent read from PalDB
-    private Map<String, double[]> testValues;
+    private Map<Integer, DoubleContainer> testValues;
     private final int NUMBER_OF_TEST_VALUES = 1000000;
     private final int ARRAY_LENGTH = 256;
 
     /**
-     * Prepares a storage with 1,000,000 entries of double arrays with 256 values
+     * Prepares a storage with 100,000 entries of double arrays with 256 values
      */
     @BeforeClass
-    public void setUp()
+    public void setup()
     {
         STORE_FILE.delete();
         STORE_FOLDER.delete();
         STORE_FOLDER.mkdir();
 
         Random random = new Random();
-        testValues = new HashMap<>();
+        testValues = new HashMap<Integer, DoubleContainer>();
 
         for (int i = 0; i < NUMBER_OF_TEST_VALUES; i++)
         {
@@ -55,13 +56,21 @@ public class TestStoreReaderWithMultipleThreads
             for (int j = 0; j < ARRAY_LENGTH; j++) {
                 valueArray[j] = random.nextDouble();
             }
-            testValues.put(String.valueOf(i), valueArray);
+            testValues.put(i, new DoubleContainer(valueArray));
         }
 
         Configuration config = new Configuration();
-        config.registerSerializer(new DoubleArraySerializer());
+        config.set(Configuration.MMAP_DATA_ENABLED, String.valueOf(false));
+        config.set(Configuration.CACHE_ENABLED, String.valueOf(true));
+        //config.set(MMAP_SEGMENT_SIZE, "52428800");
+        config.set(CACHE_BYTES, "104857600");
+        config.registerSerializer(new DoubleContainerSerializer());
         StoreWriter writer = PalDB.createWriter(STORE_FILE, config);
-        testValues.forEach(writer::put);
+        for (Map.Entry<Integer, DoubleContainer> entry : testValues.entrySet()) {
+            Integer key = entry.getKey();
+            DoubleContainer value = entry.getValue();
+            writer.put(key, value);
+        }
         writer.close();
     }
 
@@ -83,16 +92,16 @@ public class TestStoreReaderWithMultipleThreads
     @Test
     public void testThreadedRead() throws InterruptedException
     {
-        final int threads = 20;
+        final int threads = 10;
         final int keysToReadPerExecution = 100000;
 
         // configuration with 1mb mmap size and 25mb LRU cache
         Configuration readConfig = new Configuration();
-        readConfig.set(Configuration.MMAP_DATA_ENABLED, String.valueOf(true));
+        readConfig.set(Configuration.MMAP_DATA_ENABLED, String.valueOf(false));
         readConfig.set(Configuration.CACHE_ENABLED, String.valueOf(true));
-        readConfig.set(MMAP_SEGMENT_SIZE, "1048576");
-        readConfig.set(CACHE_BYTES, "26214400");
-        readConfig.registerSerializer(new DoubleArraySerializer());
+        //readConfig.set(MMAP_SEGMENT_SIZE, "26214400");
+        readConfig.set(CACHE_BYTES, "504857600");
+        readConfig.registerSerializer(new DoubleContainerSerializer());
         StoreReader reader = PalDB.createReader(STORE_FILE, readConfig);
 
         // execute threads
@@ -100,7 +109,7 @@ public class TestStoreReaderWithMultipleThreads
         final AtomicBoolean success = new AtomicBoolean(true);
         for (int i = 0; i < threads; i++)
         {
-            new Thread(new ReaderTask( keysToReadPerExecution, reader, latch, success)).start();
+            new Thread(new ReaderTask( i, keysToReadPerExecution, reader, latch, success)).start();
         }
         latch.await();
 
@@ -109,14 +118,17 @@ public class TestStoreReaderWithMultipleThreads
 
     private class ReaderTask implements Runnable
     {
+        private final int threadId;
         private final int keysToRead;
         private final StoreReader reader;
         private final CountDownLatch latch;
         private final AtomicBoolean success;
+
         private final Random random = new Random();
 
-        ReaderTask(int keysToRead, StoreReader reader, CountDownLatch latch, AtomicBoolean success)
+        ReaderTask(int threadId, int keysToRead, StoreReader reader, CountDownLatch latch, AtomicBoolean success)
         {
+            this.threadId = threadId;
             this.keysToRead = keysToRead;
             this.reader = reader;
             this.latch = latch;
@@ -131,12 +143,20 @@ public class TestStoreReaderWithMultipleThreads
         {
             try
             {
-                for (int i = 0; i < keysToRead; i++)
+                long start = System.currentTimeMillis();
+                Integer[] keys = GenerateTestData.generateRandomIntKeys(1000000, NUMBER_OF_TEST_VALUES, (long) 4242);
+                for ( int i = 0; i < keys.length; i++ )
                 {
-                    int key = random.nextInt(NUMBER_OF_TEST_VALUES);
-                    double[] storedValues = reader.get(key);
-                    Assert.assertTrue(Arrays.equals(storedValues, testValues.get(key)));
+                    int key = keys[i];
+                    DoubleContainer container = reader.get(key);
+                    if ( !testValues.get(key).equals(container) )
+                    {
+                        throw new RuntimeException("fail");
+                    }
                 }
+                long finish = System.currentTimeMillis();
+                long timeElapsed = finish - start;
+                System.out.println("Thread" + threadId + " finished in " + timeElapsed + "ms");
             }
             catch (Exception e)
             {
@@ -150,38 +170,56 @@ public class TestStoreReaderWithMultipleThreads
         }
     }
 
-    public static class DoubleArraySerializer implements Serializer<Double[]>
+    public class DoubleContainer
     {
-        @Override
-        public void write(DataOutput dataOutput, Double[] input) throws IOException
-        {
-            LongPacker.packInt(dataOutput, input.length);
+        public double[] values;
 
-            for (double d : input)
+        public DoubleContainer(double[] values)
+        {
+            this.values = values;
+        }
+
+        @Override
+        public boolean equals(Object o)
+        {
+            return Arrays.equals(values, ((DoubleContainer)o).values);
+        }
+    }
+
+    public class DoubleContainerSerializer implements Serializer<DoubleContainer>
+    {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public void write(DataOutput dataOutput, DoubleContainer input) throws IOException
+        {
+            LongPacker.packInt(dataOutput, input.values.length);
+
+            for (double d : input.values)
             {
                 dataOutput.writeDouble(d);
             }
         }
 
         @Override
-        public Double[] read(DataInput dataInput) throws IOException
+        public DoubleContainer read(DataInput dataInput) throws IOException
         {
             int length = LongPacker.unpackInt(dataInput);
 
-            Double[] data = new Double[length];
+            double[] data = new double[length];
             for (int i = 0; i < length; i++)
             {
                 data[i] = dataInput.readDouble();
             }
 
-            return data;
+            return new DoubleContainer(data);
         }
 
         @Override
-        public int getWeight(Double[] instance)
+        public int getWeight(DoubleContainer instance)
         {
             return instance != null
-                    ? 8 * instance.length
+                    ? 8 * instance.values.length
                     : 0;
         }
     }
